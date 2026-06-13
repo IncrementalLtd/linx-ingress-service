@@ -1,0 +1,4 @@
+# Build output / deployable artifacts
+/publish/
+MqiptConsumer/bin/
+MqiptConsumer/obj/
