@@ -83,49 +83,82 @@ if (!string.IsNullOrEmpty(settings.UserId))
         connectionProps.Add(MQC.PASSWORD_PROPERTY, settings.Password);
 }
 
-MQQueueManager? qmgr = null;
-MQQueue? queue = null;
+// Cumulative across reconnects so the throughput line stays continuous.
+long processed = 0;
+long lastReported = 0;
+var reportInterval = TimeSpan.FromSeconds(15);
+
+// Periodic throughput summary so the consumer isn't silent when per-message
+// logging is off. Reads only the interlocked counter — never touches the MQ
+// objects, which are not thread-safe.
+using var statsTimer = new Timer(_ =>
+{
+    long total = Interlocked.Read(ref processed);
+    long delta = total - Interlocked.Exchange(ref lastReported, total);
+    double rate = delta / reportInterval.TotalSeconds;
+    Console.WriteLine($"[stats] processed {total} total | {delta} in last {reportInterval.TotalSeconds:0}s ({rate:0.#}/s)");
+}, null, reportInterval, reportInterval);
+
+int reconnectAttempt = 0;
 
 try
 {
-    Console.WriteLine("Connecting...");
-    qmgr = new MQQueueManager(settings.QueueManager, connectionProps);
-    Console.WriteLine("Connected.");
-
-    // Open the queue for input (consuming). Accept whatever the queue's default
-    // input setting allows (shared by default). MQOO_INQUIRE lets us read CurrentDepth.
-    // In relaxed mode, MQOO_READ_AHEAD lets the server stream messages to the client
-    // buffer instead of one round-trip per get (incompatible with syncpoint).
-    int openOptions = MQC.MQOO_INPUT_AS_Q_DEF | MQC.MQOO_INQUIRE | MQC.MQOO_FAIL_IF_QUIESCING;
-    if (!reliable) openOptions |= MQC.MQOO_READ_AHEAD;
-    queue = qmgr.AccessQueue(settings.QueueName, openOptions);
-    Console.Write($"Opened queue '{settings.QueueName}'.");
-    try
+    // Reconnect loop: a dropped connection (e.g. MQRC_CONNECTION_BROKEN) tears the
+    // session down and reconnects with capped exponential backoff instead of exiting.
+    while (!cts.IsCancellationRequested)
     {
-        // CurrentDepth is only valid for local queues; remote/alias queues report 2068.
-        Console.Write($" Current depth: {queue.CurrentDepth} message(s).");
+        try
+        {
+            await RunSessionAsync();
+            // RunSessionAsync only returns normally on shutdown.
+        }
+        catch (MQException mqe) when (!cts.IsCancellationRequested && !IsFatal(mqe.ReasonCode))
+        {
+            reconnectAttempt++;
+            TimeSpan delay = BackoffDelay(reconnectAttempt);
+            Console.Error.WriteLine(
+                $"MQ connection problem: CompCode={mqe.CompCode} Reason={mqe.ReasonCode} ({mqe.Message}). " +
+                $"Reconnecting in {delay.TotalSeconds:0.#}s (attempt {reconnectAttempt})...");
+            try { await Task.Delay(delay, cts.Token); }
+            catch (OperationCanceledException) { break; }
+        }
     }
-    catch (MQException) { /* depth not available for this queue type */ }
-    Console.WriteLine("\nWaiting for messages (Ctrl+C to stop)...\n");
+}
+catch (MQException mqe)
+{
+    // Fatal/config error (bad credentials, unknown queue, ...). Don't spin forever —
+    // exit non-zero so an external supervisor surfaces it rather than hiding a loop.
+    Console.Error.WriteLine($"MQ fatal error: CompCode={mqe.CompCode} Reason={mqe.ReasonCode} ({mqe.Message})");
+    return 1;
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"Unexpected error: {ex}");
+    return 1;
+}
+finally
+{
+    kinesis?.Dispose();
+    Console.WriteLine("Stopped.");
+}
 
-    var getOptions = new MQGetMessageOptions
-    {
-        // Wait up to WaitIntervalMs for a message, then time out and loop.
-        // Reliable mode adds SYNCPOINT so each get stays uncommitted until the batch
-        // is published — messages are only removed after a successful PutRecords.
-        // Relaxed mode omits syncpoint so read-ahead can pipeline gets.
-        Options = MQC.MQGMO_WAIT | MQC.MQGMO_FAIL_IF_QUIESCING | (reliable ? MQC.MQGMO_SYNCPOINT : MQC.MQGMO_NO_SYNCPOINT),
-        WaitInterval = settings.WaitIntervalMs,
-    };
+return 0;
 
-    // Accumulate messages, then publish the whole batch with one PutRecords call.
+// ----------------------------------------------------------------------------
+// One connect → open → consume session. Throws MQException if connecting fails or
+// the connection drops mid-stream; the caller decides whether to reconnect.
+// ----------------------------------------------------------------------------
+async Task RunSessionAsync()
+{
+    MQQueueManager? qmgr = null;
+    MQQueue? queue = null;
     var batch = new List<(string Body, string PartitionKey)>(batchSize);
-    long processed = 0; // total committed; read from the stats timer thread too.
 
     // Publish the current batch. In reliable mode, commit (remove) the messages only
     // after a successful publish, or back them out for redelivery on failure. In
     // relaxed mode the messages already left the queue (no syncpoint), so a failure
-    // is an unavoidable drop. No-op for an empty batch.
+    // is an unavoidable drop. MQ errors (e.g. a broken connection during commit) are
+    // rethrown so the caller can reconnect. No-op for an empty batch.
     async Task FlushAsync()
     {
         if (batch.Count == 0) return;
@@ -142,6 +175,12 @@ try
         {
             // Shutting down mid-publish. Reliable: leave uncommitted so MQ backs it
             // out on disconnect. Relaxed: messages already gone — nothing to do.
+        }
+        catch (MQException)
+        {
+            // Connection/commit failure — bubble up to trigger a reconnect. The
+            // uncommitted unit of work backs out automatically on disconnect.
+            throw;
         }
         catch (Exception ex)
         {
@@ -163,69 +202,75 @@ try
         }
     }
 
-    // Periodic throughput summary so the consumer isn't silent when per-message
-    // logging is off. Reads only the interlocked counter — never touches the MQ
-    // objects, which are not thread-safe.
-    var reportInterval = TimeSpan.FromSeconds(15);
-    long lastReported = 0;
-    using var statsTimer = new Timer(_ =>
+    try
     {
-        long total = Interlocked.Read(ref processed);
-        long delta = total - Interlocked.Exchange(ref lastReported, total);
-        double rate = delta / reportInterval.TotalSeconds;
-        Console.WriteLine($"[stats] processed {total} total | {delta} in last {reportInterval.TotalSeconds:0}s ({rate:0.#}/s)");
-    }, null, reportInterval, reportInterval);
+        Console.WriteLine("Connecting...");
+        qmgr = new MQQueueManager(settings.QueueManager, connectionProps);
+        Console.WriteLine("Connected.");
+        reconnectAttempt = 0; // healthy connection — reset the backoff
 
-    while (!cts.IsCancellationRequested)
-    {
-        // A fresh message object each iteration so we don't accumulate buffer state.
-        var message = new MQMessage();
+        // Open the queue for input (consuming). MQOO_INQUIRE lets us read CurrentDepth.
+        // In relaxed mode, MQOO_READ_AHEAD lets the server stream messages to the client
+        // buffer instead of one round-trip per get (incompatible with syncpoint).
+        int openOptions = MQC.MQOO_INPUT_AS_Q_DEF | MQC.MQOO_INQUIRE | MQC.MQOO_FAIL_IF_QUIESCING;
+        if (!reliable) openOptions |= MQC.MQOO_READ_AHEAD;
+        queue = qmgr.AccessQueue(settings.QueueName, openOptions);
+        Console.Write($"Opened queue '{settings.QueueName}'.");
         try
         {
-            queue.Get(message, getOptions);
-
-            string body = ReadBody(message);
-            string msgId = ToHex(message.MessageId);
-            batch.Add((body, msgId));
-
-            if (debug)
-            {
-                Console.WriteLine($"[{Interlocked.Read(ref processed) + batch.Count}] MsgId={msgId} " +
-                                  $"Format={message.Format.Trim()} Bytes={message.MessageLength}");
-                Console.WriteLine(body);
-                Console.WriteLine(new string('-', 60));
-            }
-
-            if (batch.Count >= batchSize)
-                await FlushAsync();
+            // CurrentDepth is only valid for local queues; remote/alias queues report 2068.
+            Console.Write($" Current depth: {queue.CurrentDepth} message(s).");
         }
-        catch (MQException mqe) when (mqe.ReasonCode == MQC.MQRC_NO_MSG_AVAILABLE)
+        catch (MQException) { /* depth not available for this queue type */ }
+        Console.WriteLine("\nWaiting for messages (Ctrl+C to stop)...\n");
+
+        var getOptions = new MQGetMessageOptions
         {
-            // Queue drained for now — publish whatever we've accumulated, then poll again.
-            await FlushAsync();
-            continue;
+            // Wait up to WaitIntervalMs for a message, then time out and loop.
+            // Reliable mode adds SYNCPOINT so each get stays uncommitted until the batch
+            // is published — messages are only removed after a successful PutRecords.
+            // Relaxed mode omits syncpoint so read-ahead can pipeline gets.
+            Options = MQC.MQGMO_WAIT | MQC.MQGMO_FAIL_IF_QUIESCING | (reliable ? MQC.MQGMO_SYNCPOINT : MQC.MQGMO_NO_SYNCPOINT),
+            WaitInterval = settings.WaitIntervalMs,
+        };
+
+        while (!cts.IsCancellationRequested)
+        {
+            // A fresh message object each iteration so we don't accumulate buffer state.
+            var message = new MQMessage();
+            try
+            {
+                queue.Get(message, getOptions);
+
+                string body = ReadBody(message);
+                string msgId = ToHex(message.MessageId);
+                batch.Add((body, msgId));
+
+                if (debug)
+                {
+                    Console.WriteLine($"[{Interlocked.Read(ref processed) + batch.Count}] MsgId={msgId} " +
+                                      $"Format={message.Format.Trim()} Bytes={message.MessageLength}");
+                    Console.WriteLine(body);
+                    Console.WriteLine(new string('-', 60));
+                }
+
+                if (batch.Count >= batchSize)
+                    await FlushAsync();
+            }
+            catch (MQException mqe) when (mqe.ReasonCode == MQC.MQRC_NO_MSG_AVAILABLE)
+            {
+                // Queue drained for now — publish whatever we've accumulated, then poll again.
+                await FlushAsync();
+                continue;
+            }
         }
     }
+    finally
+    {
+        try { queue?.Close(); } catch { /* ignore */ }
+        try { qmgr?.Disconnect(); } catch { /* ignore */ }
+    }
 }
-catch (MQException mqe)
-{
-    Console.Error.WriteLine($"MQ error: CompCode={mqe.CompCode} Reason={mqe.ReasonCode} ({mqe.Message})");
-    return 1;
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"Unexpected error: {ex}");
-    return 1;
-}
-finally
-{
-    try { queue?.Close(); } catch { /* ignore */ }
-    try { qmgr?.Disconnect(); } catch { /* ignore */ }
-    kinesis?.Dispose();
-    Console.WriteLine("Disconnected.");
-}
-
-return 0;
 
 // ----------------------------------------------------------------------------
 // Helpers
@@ -247,3 +292,22 @@ static string ReadBody(MQMessage message)
 }
 
 static string ToHex(byte[] bytes) => Convert.ToHexString(bytes);
+
+// Reason codes we treat as fatal (config/credential problems that won't fix
+// themselves). Everything else is assumed transient and triggers a reconnect.
+static bool IsFatal(int reason) => reason switch
+{
+    MQC.MQRC_NOT_AUTHORIZED => true,       // 2035 — bad credentials / not authorised
+    MQC.MQRC_Q_MGR_NAME_ERROR => true,     // 2058 — wrong queue manager name
+    MQC.MQRC_UNKNOWN_OBJECT_NAME => true,  // 2085 — queue does not exist
+    MQC.MQRC_UNKNOWN_CHANNEL_NAME => true, // 2540 — wrong channel name
+    _ => false,
+};
+
+// Exponential backoff capped at ~60s, plus up to 1s of jitter so multiple
+// consumers don't all reconnect in lockstep after a shared outage.
+static TimeSpan BackoffDelay(int attempt)
+{
+    double seconds = Math.Min(60, Math.Pow(2, Math.Min(attempt, 6)));
+    return TimeSpan.FromSeconds(seconds + Random.Shared.NextDouble());
+}
