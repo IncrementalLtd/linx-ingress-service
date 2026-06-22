@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($errs=$null;$tokens=$null;[System.Management.Automation.Language.Parser]::ParseFile\\('C:\\\\Git\\\\linx-ingress-service\\\\MqiptConsumer\\\\Deploy-LinxConsumers.ps1',[ref]$tokens,[ref]$errs\\)|Out-Null; if\\($errs\\){\"PARSE ERRORS:\";$errs|ForEach-Object{$_.Message}}else{\"Syntax OK\"}; Copy-Item C:\\\\Git\\\\linx-ingress-service\\\\MqiptConsumer\\\\Deploy-LinxConsumers.ps1 C:\\\\Git\\\\linx-ingress-service\\\\publish\\\\MqiptConsumer-win-x64\\\\Deploy-LinxConsumers.ps1 -Force; \"copied to artifact\")",
+      "PowerShell($src='C:\\\\Git\\\\linx-ingress-service\\\\publish\\\\MqiptConsumer-win-x64'; $tmp=Join-Path $env:TEMP 'LinxDeployTest'; if\\(Test-Path $tmp\\){Remove-Item $tmp -Recurse -Force}; & \"$src\\\\Deploy-LinxConsumers.ps1\" -SourceDir $src -DestRoot $tmp -SkipServices -MqHost '10.0.0.5'; \"`n=== Layout ===\"; Get-ChildItem $tmp -Recurse -File | ForEach-Object { $_.FullName.Substring\\($tmp.Length+1\\) } ; \"`n=== VSCSLEI config \\(host patched, queue/stream/delivery from sample\\) ===\"; Get-Content \\(Join-Path $tmp 'VSCSLEI\\\\appsettings.json'\\) -Raw; \"`n=== TDCSLEI delivery should be Relaxed ===\"; \\(Get-Content \\(Join-Path $tmp 'TDCSLEI\\\\appsettings.json'\\) -Raw | ConvertFrom-Json\\).DeliveryMode; Remove-Item $tmp -Recurse -Force; \"`n\\(temp cleaned\\)\")",
+      "PowerShell($errs=$null;$tokens=$null;[System.Management.Automation.Language.Parser]::ParseFile\\('C:\\\\Git\\\\linx-ingress-service\\\\MqiptConsumer\\\\Deploy-LinxConsumers.ps1',[ref]$tokens,[ref]$errs\\)|Out-Null; if\\($errs\\){\"PARSE ERRORS:\";$errs|ForEach-Object{$_.Message}}else{\"Syntax OK\"})"
+    ]
+  }
+}
